@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+Consumed by `git` reference to the tag `v0.1.1`. Depends on `dart_backend_framework` 0.1.0 and
+`dart_db_connector_postgres` 0.1.1.
+
+- No code change. The connector dependency moves to 0.1.1, so this extension and the connector at 0.1.1 can be
+  used together; on 0.1.0 they conflicted in `pub get`.
+
 ## 0.1.0
 
 First public release, consumed by `git` reference to the tag `v0.1.0`. Depends on `dart_backend_framework`

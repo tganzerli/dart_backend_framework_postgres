@@ -12,7 +12,7 @@ dependencies:
   dart_backend_framework_postgres:
     git:
       url: https://github.com/tganzerli/dart_backend_framework_postgres
-      ref: v0.1.0
+      ref: v0.1.1
 ```
 
 The connector ships its native library pre-built and needs `libpq` at run time;

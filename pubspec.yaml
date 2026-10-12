@@ -2,7 +2,7 @@ name: dart_backend_framework_postgres
 description: >
   PostgreSQL extensions for dart_backend_framework: a per-request
   row-level-security transaction middleware.
-version: 0.1.0
+version: 0.1.1
 publish_to: none
 
 repository: https://github.com/tganzerli/dart_backend_framework_postgres
@@ -18,7 +18,7 @@ dependencies:
   dart_db_connector_postgres:
     git:
       url: https://github.com/tganzerli/dart_db_connector_postgres
-      ref: v0.1.0
+      ref: v0.1.1
   meta: ^1.15.0
 
 dev_dependencies:
