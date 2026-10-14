@@ -1,4 +1,5 @@
-/// Integration tests against the dev Postgres (`docker/postgres/docker-compose.yml`):
+/// Integration tests against PostgreSQL at localhost:5432 (database `teste`,
+/// superuser `postgres`; see the README, "Tests"):
 /// a connection borrowed per request, holding session state, must go back to
 /// the pool clean through `Request.addCleanupHook` — after the response is
 /// fully written, and also when the handler throws. This is the per-request

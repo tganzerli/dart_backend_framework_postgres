@@ -1,8 +1,11 @@
 # dart_backend_framework_postgres
 
-PostgreSQL extensions for [`dart_backend_framework`](https://github.com/tganzerli/dart_backend_framework).
-The framework has no database dependency; this package plugs into it and ties a
-request to [`dart_db_connector_postgres`](https://github.com/tganzerli/dart_db_connector_postgres).
+PostgreSQL kit for [`dart_backend_framework`](https://github.com/tganzerli/dart_backend_framework),
+for applications that use it together with
+[`dart_db_connector_postgres`](https://github.com/tganzerli/dart_db_connector_postgres).
+The framework has no database dependency; this package holds the
+PostgreSQL-specific pieces for using the two together: a per-request RLS
+transaction (`rlsTransaction`) and a prefix search builder (`prefixTsQuery`).
 
 **Experimental, not on pub.dev yet.** Install by `git` reference to a tag; the
 framework and the connector come with it:
@@ -12,7 +15,7 @@ dependencies:
   dart_backend_framework_postgres:
     git:
       url: https://github.com/tganzerli/dart_backend_framework_postgres
-      ref: v0.1.1
+      ref: v0.1.2
 ```
 
 The connector ships its native library pre-built and needs `libpq` at run time;
@@ -75,10 +78,13 @@ session reset on return. The cost of this middleware has not been measured.
 
 ### Tests
 
-`test/rls_middleware_test.dart` needs no database. `test/integration/rls_live_test.dart`
-needs PostgreSQL at `localhost:5432` (`dbname=teste user=postgres password=123`,
-a superuser, because it creates schema `rls_mw` and roles `rls_mw_owner`/`rls_mw_app`),
-so do not run two instances at once:
+`test/rls_middleware_test.dart` and `test/prefix_ts_query_test.dart` need no
+database. The integration tests (`test/integration/postgres_live_test.dart`,
+`rls_live_test.dart` and `prefix_ts_query_live_test.dart`) need PostgreSQL at
+`localhost:5432` (`dbname=teste user=postgres password=123`).
+`prefix_ts_query_live_test.dart` creates no schema or role.
+`rls_live_test.dart` uses a superuser because it creates schema `rls_mw` and
+roles `rls_mw_owner`/`rls_mw_app`, so do not run two instances at once:
 
 ```bash
 dart test
@@ -101,6 +107,51 @@ Parameters (environment): `STRESS_REQUESTS` (400), `STRESS_USERS` (32), `STRESS_
 It covers four pool configurations (1, 4, 2 without session reset, 2 with a 100 ms acquire timeout), four tenants with one hot tenant, client aborts at four moments, handlers that fail or answer 409, and a clean shutdown (`server.close()` then `pool.close()`) with requests in flight, plus a stream the client abandons before the first byte.
 
 The suite SKIPS silently when the native library or Postgres is missing: check the printed `executed=N skipped=M` line (skipped must be 0).
+
+## `prefixTsQuery`: prefix search from free text
+
+Turns what a user types into a prefix `tsquery`, safe to bind as a parameter:
+
+```dart
+prefixTsQuery('jo sil');      // "'jo':* & 'sil':*"
+prefixTsQuery("d'avila & !"); // "'d':* & 'avila':*"
+prefixTsQuery('  &|! ');      // null
+```
+
+With a generated `tsvector` column and a GIN index:
+
+```sql
+CREATE TABLE person (
+  id   serial PRIMARY KEY,
+  name text NOT NULL,
+  doc  tsvector GENERATED ALWAYS AS (to_tsvector('simple', name)) STORED
+);
+CREATE INDEX person_doc ON person USING gin (doc);
+```
+
+```dart
+final q = prefixTsQuery(term);
+if (q == null) return Response.badRequest(); // or run the query without the filter
+final rows = await request.rls.executor.execute(
+  "SELECT id, name FROM person WHERE doc @@ to_tsquery('simple', \$1)",
+  params: [Param.text(q)],
+);
+```
+
+Only runs of Unicode letters, combining marks and digits survive; every other
+character (`& | ! ( ) : * < - >`, quotes, backslashes, spaces, punctuation) is
+a separator. Each word becomes a quoted prefix lexeme, joined with `&`.
+
+- **Normalise the input the way the index was built.** Case is folded by the
+  text search configuration, but accents are kept: if the `tsvector` comes from
+  `unaccent(...)`, apply the same removal to the term.
+- **`null` means no word**: skip the filter. `to_tsquery` on an empty string
+  matches nothing.
+- **Always bind the result** (`Param.text`); never concatenate it into SQL.
+
+### Cost
+
+One regular expression pass over the input. Not measured.
 
 ## Example: CRUD server
 

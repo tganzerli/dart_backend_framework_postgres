@@ -1,8 +1,11 @@
-/// PostgreSQL extensions for `dart_backend_framework`.
+/// PostgreSQL kit for `dart_backend_framework`.
 ///
-/// The core framework has no database dependency. This package
-/// holds the pieces that tie a request to the PostgreSQL connector.
+/// For applications that use the framework together with
+/// `dart_db_connector_postgres`. The framework has no database dependency;
+/// this package holds the PostgreSQL-specific pieces for using the two together.
 library;
+
+export 'src/fts/prefix_ts_query.dart' show prefixTsQuery;
 
 export 'src/rls/rls_exceptions.dart'
     show RlsCommitException, RlsContextException, RlsException;

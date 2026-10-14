@@ -1,4 +1,5 @@
-/// RLS middleware against the dev Postgres (`docker/postgres/docker-compose.yml`).
+/// RLS middleware against PostgreSQL at localhost:5432 (database `teste`,
+/// superuser `postgres`; see the README, "Tests").
 ///
 /// The application pool connects as `rls_mw_app`: not a superuser, not the
 /// table owner, no BYPASSRLS, over a table with FORCE ROW LEVEL SECURITY. The
