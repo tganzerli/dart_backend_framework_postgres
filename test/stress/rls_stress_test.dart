@@ -4,6 +4,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:dart_backend_framework_postgres/dart_backend_framework_postgres.dart';
 import 'package:dart_db_connector_postgres/dart_db_connector_postgres.dart';
@@ -166,6 +167,123 @@ void main() {
     });
   }
 
+  /// Repository mode under the same load: no HTTP, each caller opens its own
+  /// transaction. A third of the calls throw and a sixth set rollback-only,
+  /// after inserting, so their rows must never survive.
+  void repositoryTest(String name, {required int maxSize, String? reset}) {
+    test(name, () async {
+      if (skipReason != null) {
+        skipped++;
+        markTestSkipped(skipReason!);
+        return;
+      }
+      executed++;
+      await withPostgresConnection<void>(admin!, (exec) async {
+        (await exec.execute('TRUNCATE rls_stress.note')).release();
+      });
+      final pool = PostgresConnectionPool(PoolConfig(
+          connInfo: appConn,
+          minSize: 1,
+          maxSize: maxSize,
+          acquireTimeout: const Duration(seconds: 10),
+          sessionResetQuery: reset));
+      await pool.start();
+      final sampler = Sampler(pool)..start();
+      final rng = Random(params.seed);
+      final committed = <String>{};
+      final violations = <String>[];
+      var next = 0, thrown = 0;
+
+      Future<void> call(int seq) async {
+        final k = rng.nextInt(10) < 4 ? 0 : 1 + rng.nextInt(3);
+        final roll = rng.nextInt(6);
+        final delay = rng.nextInt(4);
+        final marker = 't$k:$seq';
+        try {
+          await withTenantTransaction(pool, tenantIds[k], (tx) async {
+            (await tx.executor.execute(
+              r'INSERT INTO rls_stress.note (tenant_id, body) VALUES ($1::uuid, $2)',
+              params: [Param.text(tx.tenantId), Param.text(marker)],
+            ))
+                .release();
+            await Future<void>.delayed(Duration(milliseconds: delay));
+            final seen = await column(
+                tx.executor, 'SELECT body AS v FROM rls_stress.note');
+            for (final b in seen) {
+              if (!b.startsWith('t$k:')) violations.add('$marker saw $b');
+            }
+            final local = await scalar(
+                tx.executor,
+                "SELECT current_setting('app.tenant_id') || '|' || "
+                "current_setting('app.correlation_id') AS v");
+            if (local != '${tenantIds[k]}|$marker') {
+              violations.add('$marker read local settings $local');
+            }
+            if (roll < 2) throw StateError(marker);
+            if (roll == 2) tx.setRollbackOnly();
+          }, localSettings: {'app.correlation_id': marker});
+          if (roll > 2) committed.add(marker);
+        } on StateError catch (e) {
+          if (e.message != marker) rethrow;
+          thrown++;
+        }
+      }
+
+      await Future.wait([
+        for (var u = 0; u < params.users; u++)
+          () async {
+            while (next < params.requests) {
+              await call(next++);
+            }
+          }()
+      ]);
+      await settle(pool);
+      sampler.stop();
+
+      // Session hygiene: maxSize probes held at once, so each lands on a
+      // distinct backend.
+      final hygiene = <String>[];
+      for (var round = 0; round < 2; round++) {
+        final answers = await Future.wait([
+          for (var i = 0; i < maxSize; i++)
+            withPostgresConnection(
+                pool,
+                (exec) => scalar(
+                    exec,
+                    "SELECT pg_backend_pid()::text || ':' || "
+                    "coalesce(current_setting('app.tenant_id', true), '') || '|' || "
+                    "coalesce(current_setting('app.correlation_id', true), '') AS v "
+                    'FROM pg_sleep(0.05)'))
+        ]);
+        if (answers.map((a) => a.split(':').first).toSet().length != maxSize) {
+          hygiene.add('round $round: probes shared a backend');
+        }
+        hygiene.addAll(answers.where((a) => !a.endsWith(':|')));
+      }
+      final bodies = await withPostgresConnection(admin!,
+          (exec) => column(exec, 'SELECT body AS v FROM rls_stress.note'));
+      final borrowed = pool.borrowed, pending = pool.pending;
+      await pool.close();
+
+      // ignore: avoid_print
+      print('[stress] $name seed=${params.seed} committed=${committed.length} '
+          'thrown=$thrown maxBorrowed=${sampler.maxBorrowed} '
+          'maxPending=${sampler.maxPending} rows=${bodies.length}');
+
+      expect(violations, isEmpty, reason: 'seed=${params.seed}');
+      expect(bodies.toSet(), equals(committed),
+          reason: 'rows in the database differ from the committed calls');
+      expect(bodies, hasLength(committed.length));
+      expect(thrown, greaterThan(0));
+      expect(hygiene, isEmpty, reason: 'a setting leaked into the session');
+      expect(borrowed, 0);
+      expect(pending, 0);
+      expect(sampler.maxBorrowed, lessThanOrEqualTo(maxSize));
+      expect(sampler.maxPending, greaterThan(0),
+          reason: 'the load did not queue; the test proves less than intended');
+    });
+  }
+
   groupTest('G1 pool 1, DISCARD ALL', maxSize: 1);
   groupTest('G2 pool 4, DISCARD ALL', maxSize: 4);
   groupTest('G3 pool 2, no session reset', maxSize: 2, reset: null);
@@ -174,4 +292,7 @@ void main() {
       maxSize: 2,
       acquireTimeout: const Duration(milliseconds: 100),
       allow503: true);
+  repositoryTest('R1 repository mode, pool 2, DISCARD ALL',
+      maxSize: 2, reset: 'DISCARD ALL');
+  repositoryTest('R2 repository mode, pool 2, no session reset', maxSize: 2);
 }

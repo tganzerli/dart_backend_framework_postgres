@@ -45,3 +45,15 @@ final class RlsCommitException extends RlsException {
     required this.afterResponse,
   });
 }
+
+/// `withTenantTransaction` was called without a tenant. Thrown before the pool
+/// is touched, so no connection was taken.
+///
+/// Not an [RlsException]: there is no tenant and no underlying cause, and that
+/// hierarchy is sealed.
+final class TenantRequiredException implements Exception {
+  const TenantRequiredException();
+
+  @override
+  String toString() => 'TenantRequiredException';
+}

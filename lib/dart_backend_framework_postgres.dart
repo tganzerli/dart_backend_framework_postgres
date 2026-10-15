@@ -8,7 +8,11 @@ library;
 export 'src/fts/prefix_ts_query.dart' show prefixTsQuery;
 
 export 'src/rls/rls_exceptions.dart'
-    show RlsCommitException, RlsContextException, RlsException;
+    show
+        RlsCommitException,
+        RlsContextException,
+        RlsException,
+        TenantRequiredException;
 export 'src/rls/rls_middleware.dart'
     show
         CommitPredicate,
@@ -17,3 +21,5 @@ export 'src/rls/rls_middleware.dart'
         rlsTransaction,
         rlsTransactionOn;
 export 'src/rls/rls_transaction.dart' show RlsRequest, RlsTransaction;
+export 'src/rls/tenant_transaction.dart'
+    show withTenantTransaction, withTenantTransactionOn;

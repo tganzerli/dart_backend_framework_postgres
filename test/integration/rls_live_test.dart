@@ -393,6 +393,88 @@ void main() {
         expect(reported.whereType<RlsException>(), isEmpty);
         expect(reported.whereType<StateError>(), hasLength(1));
       });
+
+      // Repository mode: the same transaction, opened by the caller.
+      Future<void> insertAs(String tenant, String body) =>
+          withTenantTransaction(pool, tenant, (tx) async {
+            (await tx.executor.execute(
+              r'INSERT INTO rls_mw.note (tenant_id, body) VALUES ($1::uuid, $2)',
+              params: [Param.text(tx.tenantId), Param.text(body)],
+            ))
+                .release();
+          });
+
+      Future<List<String>> bodiesAs(String tenant) => withTenantTransaction(
+          pool,
+          tenant,
+          (tx) => column(
+              tx.executor, 'SELECT body AS v FROM rls_mw.note ORDER BY id'));
+
+      liveTest('12. repository mode: each tenant sees only its own rows',
+          () async {
+        await insertAs(_tenantA, 'a0');
+        await insertAs(_tenantB, 'b0');
+        await insertAs(_tenantA, 'a1');
+        expect(await bodiesAs(_tenantA), ['a0', 'a1']);
+        expect(await bodiesAs(_tenantB), ['b0']);
+        expect(await notes('token-b'), ['b0'],
+            reason: 'the two modes share the policy');
+        await expectPoolFree(pool);
+      });
+
+      liveTest(
+          '13. repository mode: a throwing body and setRollbackOnly roll back',
+          () async {
+        await expectLater(
+          withTenantTransaction(pool, _tenantA, (tx) async {
+            (await tx.executor.execute(
+              r"INSERT INTO rls_mw.note (tenant_id, body) VALUES ($1::uuid, 'ghost')",
+              params: [Param.text(tx.tenantId)],
+            ))
+                .release();
+            throw StateError('failure after insert');
+          }),
+          throwsA(isA<StateError>()),
+        );
+        final kept = await withTenantTransaction(pool, _tenantA, (tx) async {
+          (await tx.executor.execute(
+            r"INSERT INTO rls_mw.note (tenant_id, body) VALUES ($1::uuid, 'dry')",
+            params: [Param.text(tx.tenantId)],
+          ))
+              .release();
+          tx.setRollbackOnly();
+          return 'returned';
+        });
+        expect(kept, 'returned');
+        expect(await bodiesAs(_tenantA), isEmpty);
+        await expectPoolFree(pool);
+      });
+
+      liveTest(
+          '14. repository mode: local settings hold inside the transaction only',
+          () async {
+        final inside = await withTenantTransaction(
+          pool,
+          _tenantB,
+          (tx) => column(
+              tx.executor,
+              "SELECT current_setting('app.tenant_id') || '|' || "
+              "current_setting('app.correlation_id') AS v"),
+          localSettings: {'app.correlation_id': 'corr-7'},
+        );
+        expect(inside, ['$_tenantB|corr-7']);
+        for (var i = 0; i < 3; i++) {
+          final after = await withPostgresConnection(
+              pool,
+              (exec) => column(
+                  exec,
+                  "SELECT coalesce(current_setting('app.correlation_id', true), '') "
+                  "|| '|' || coalesce(current_setting('app.tenant_id', true), '') AS v"));
+          expect(after, ['|'],
+              reason: 'a local setting leaked into the session');
+        }
+        await expectPoolFree(pool);
+      });
     });
   }
 
@@ -445,6 +527,39 @@ void main() {
       } finally {
         client.close(force: true);
         await server.close(force: true);
+        await pool.close();
+      }
+    });
+  });
+
+  group('15. exhausted pool, repository mode', () {
+    test(
+        'propagates PoolExhaustedException while another call holds the only connection',
+        () async {
+      if (skipReason != null) {
+        markTestSkipped(skipReason!);
+        return;
+      }
+      final pool = PostgresConnectionPool(PoolConfig(
+        connInfo: _appConn,
+        minSize: 1,
+        maxSize: 1,
+        acquireTimeout: const Duration(milliseconds: 200),
+      ));
+      await pool.start();
+      try {
+        final first = withTenantTransaction(pool, _tenantA, (tx) async {
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+          return 'held';
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await expectLater(
+          withTenantTransaction(pool, _tenantB, (tx) async => 'second'),
+          throwsA(isA<PoolExhaustedException>()),
+        );
+        expect(await first, 'held');
+        await expectPoolFree(pool);
+      } finally {
         await pool.close();
       }
     });

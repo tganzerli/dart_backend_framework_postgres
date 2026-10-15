@@ -20,11 +20,19 @@ final class RlsTransaction {
   /// Name of the setting that carries the tenant.
   final String settingName;
 
+  /// Other transaction-local settings applied with the tenant.
+  final Map<String, String> _localSettings;
+
   bool _rollbackOnly = false;
   bool _deferredCommit = false;
 
   @internal
-  RlsTransaction.internal(this._uow, this.tenantId, this.settingName);
+  RlsTransaction.internal(
+    this._uow,
+    this.tenantId,
+    this.settingName, {
+    Map<String, String> localSettings = const {},
+  }) : _localSettings = localSettings;
 
   /// Executor pinned to the transaction. Throws [TransactionStateError] once
   /// the transaction has ended.
@@ -41,12 +49,22 @@ final class RlsTransaction {
 
   /// `set_config(name, tenant, true)`: transaction-local, both values bound as
   /// parameters (Extended protocol), first statement of the transaction.
+  ///
+  /// The local settings, when present, go in the same `SELECT`, one
+  /// `set_config` each, after the tenant. Without them the statement is the
+  /// single-setting one.
   @internal
   Future<void> applyContext() async {
-    final rs = await _uow.executor.execute(
-      r'SELECT set_config($1, $2, true)',
-      params: [Param.text(settingName), Param.text(tenantId)],
-    );
+    final sql = StringBuffer(r'SELECT set_config($1, $2, true)');
+    final params = [Param.text(settingName), Param.text(tenantId)];
+    for (final MapEntry(:key, :value) in _localSettings.entries) {
+      final n = params.length;
+      sql.write(', set_config(\$${n + 1}, \$${n + 2}, true)');
+      params
+        ..add(Param.text(key))
+        ..add(Param.text(value));
+    }
+    final rs = await _uow.executor.execute(sql.toString(), params: params);
     rs.release();
   }
 

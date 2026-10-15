@@ -5,7 +5,9 @@ for applications that use it together with
 [`dart_db_connector_postgres`](https://github.com/tganzerli/dart_db_connector_postgres).
 The framework has no database dependency; this package holds the
 PostgreSQL-specific pieces for using the two together: a per-request RLS
-transaction (`rlsTransaction`) and a prefix search builder (`prefixTsQuery`).
+transaction (`rlsTransaction`), the same transaction opened by a repository or
+use case (`withTenantTransaction`), and a prefix search builder
+(`prefixTsQuery`).
 
 **Experimental, not on pub.dev yet.** Install by `git` reference to a tag; the
 framework and the connector come with it:
@@ -15,7 +17,7 @@ dependencies:
   dart_backend_framework_postgres:
     git:
       url: https://github.com/tganzerli/dart_backend_framework_postgres
-      ref: v0.1.2
+      ref: v0.1.3
 ```
 
 The connector ships its native library pre-built and needs `libpq` at run time;
@@ -55,6 +57,26 @@ the pool, from a cleanup hook if nothing else did.
 | No tenant (`null` or empty) | `onUnresolved`; no connection is borrowed, no `next()` |
 | Pool exhausted | 503 with `Retry-After: 1` (`onUnavailable`) |
 
+### Errors and configuration
+
+Failures of the transaction itself are thrown as the sealed **`RlsException`**, so an `errorHandler` can switch
+over it. Each carries the `tenantId`, and the original database error stays in `cause` / `causeStackTrace`;
+`toString` does not repeat the server message, so mapping it to a response never leaks it by accident.
+
+| Exception | When | What the client gets |
+|---|---|---|
+| `RlsContextException` | applying the tenant setting failed; already rolled back, connection returned | whatever the `errorHandler` answers |
+| `RlsCommitException`, `afterResponse: false` | `COMMIT` failed before the response was written | whatever the `errorHandler` answers |
+| `RlsCommitException`, `afterResponse: true` | `COMMIT` of a streamed body failed after the last byte | the response already sent; the failure only reaches `onError` |
+
+The callbacks are typed: `tenantResolver` is a **`TenantResolver`** (`FutureOr<String?> Function(Request)`, where
+`null` or empty means no tenant) and `shouldCommit` a **`CommitPredicate`** (`bool Function(Response)`,
+`commitOnSuccess` by default). `settingName` (default `app.tenant_id`) must match the name the database policy
+reads.
+
+`rlsTransactionOn` is the same middleware over any `UnitOfWork` factory. It exists to exercise the policy in
+tests without the native library or a database; production code uses `rlsTransaction`.
+
 ### Rules this package cannot enforce
 
 - **Streamed routes under RLS must be read-only.** A `COMMIT` that fails after
@@ -78,8 +100,8 @@ session reset on return. The cost of this middleware has not been measured.
 
 ### Tests
 
-`test/rls_middleware_test.dart` and `test/prefix_ts_query_test.dart` need no
-database. The integration tests (`test/integration/postgres_live_test.dart`,
+`test/rls_middleware_test.dart`, `test/tenant_transaction_test.dart` and
+`test/prefix_ts_query_test.dart` need no database. The integration tests (`test/integration/postgres_live_test.dart`,
 `rls_live_test.dart` and `prefix_ts_query_live_test.dart`) need PostgreSQL at
 `localhost:5432` (`dbname=teste user=postgres password=123`).
 `prefix_ts_query_live_test.dart` creates no schema or role.
@@ -104,9 +126,61 @@ dart test -t stress -r compact
 
 Parameters (environment): `STRESS_REQUESTS` (400), `STRESS_USERS` (32), `STRESS_SEED` (random, always printed; the same seed rebuilds the same intents). It uses its own schema and roles (`rls_stress*`), so it can run next to `rls_live_test.dart`.
 
-It covers four pool configurations (1, 4, 2 without session reset, 2 with a 100 ms acquire timeout), four tenants with one hot tenant, client aborts at four moments, handlers that fail or answer 409, and a clean shutdown (`server.close()` then `pool.close()`) with requests in flight, plus a stream the client abandons before the first byte.
+It covers four pool configurations (1, 4, 2 without session reset, 2 with a 100 ms acquire timeout), four tenants with one hot tenant, client aborts at four moments, handlers that fail or answer 409, and a clean shutdown (`server.close()` then `pool.close()`) with requests in flight, plus a stream the client abandons before the first byte. Two more cases run `withTenantTransaction` directly under the same parameters (pool of 2, with and without session reset), with bodies that throw or set rollback-only after inserting, and check that no caller sees another tenant's rows or a stale local setting.
 
 The suite SKIPS silently when the native library or Postgres is missing: check the printed `executed=N skipped=M` line (skipped must be 0).
+
+## `withTenantTransaction`: one RLS transaction opened by the repository
+
+`rlsTransaction` keeps the transaction open for the whole handler. When a use
+case has to call something slow or external (a KMS, another service) outside
+the transaction, open it where it is needed instead:
+
+```dart
+final appointment = await withTenantTransaction(pool, principal.tenantId,
+    (tx) async {
+  final rs = await tx.executor.execute(
+    r'SELECT ... FROM appointment WHERE id = $1',
+    params: [Param.int8(id)],
+  );
+  try {
+    return Appointment.fromRow(rs.row(0));
+  } finally {
+    rs.release();
+  }
+}, localSettings: {'app.correlation_id': correlationId});
+```
+
+The function receives the same `RlsTransaction` a handler gets from
+`request.rls` (`executor`, `tenantId`, `setRollbackOnly()`), and its value is
+returned. The two modes are independent: an application can use either, or
+both, under the same database policy.
+
+| Situation | What happens |
+|---|---|
+| tenant `null` or empty | `TenantRequiredException`, before the pool is touched |
+| pool exhausted | `PoolExhaustedException` propagates; map it (for example to 503 with `Retry-After`) |
+| applying the settings fails | rollback, then `RlsContextException` |
+| the function throws | rollback, and the error is rethrown |
+| `tx.setRollbackOnly()` | rollback, and the value is still returned |
+| `COMMIT` fails | rollback, then `RlsCommitException` with `afterResponse: false` |
+
+The connection goes back to the pool on every exit. `TenantRequiredException`
+is not an `RlsException`: there is no tenant and no database error behind it.
+
+**`localSettings`** are other transaction-local settings applied in the same
+first statement as the tenant, one `set_config(name, value, true)` each, every
+name and value bound as a parameter:
+`SELECT set_config($1, $2, true), set_config($3, $4, true), ...`. Names must be
+prefixed custom settings (`app.correlation_id`); an empty name, a name without
+a dot or the tenant's own `settingName` throws `ArgumentError` before the pool
+is touched. Without `localSettings` the statement is the one `rlsTransaction`
+sends.
+
+`withTenantTransactionOn` is the same function over any `UnitOfWork` factory,
+for tests without the native library or a database. The rules above about the
+database role, `FORCE ROW LEVEL SECURITY` and an authenticated tenant apply
+here too.
 
 ## `prefixTsQuery`: prefix search from free text
 

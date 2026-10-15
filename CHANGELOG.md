@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.3
+
+Consumed by `git` reference to the tag `v0.1.3`. Depends on `dart_backend_framework` 0.1.0 and
+`dart_db_connector_postgres` 0.1.3, as before.
+
+### Added
+
+- `withTenantTransaction(pool, tenantId, body)`: the RLS transaction opened by a repository or use case instead of
+  the request pipeline. Same sequence and exceptions as `rlsTransaction`: rollback and rethrow when the function
+  throws, rollback when `setRollbackOnly()` was called, rollback and `RlsCommitException` when `COMMIT` fails; a
+  `PoolExhaustedException` propagates. Returns the value of the function.
+- `localSettings` on `withTenantTransaction`: other transaction-local settings (such as `app.correlation_id`) applied
+  in the same first statement as the tenant, every name and value bound as a parameter. Invalid names throw
+  `ArgumentError` before the pool is touched.
+- `TenantRequiredException`, thrown before the pool is touched when the tenant is `null` or empty. It is outside the
+  sealed `RlsException`, so existing exhaustive `switch` statements keep compiling.
+- `withTenantTransactionOn`, the same function over any `UnitOfWork` factory, for tests without a database.
+
+### Changed
+
+- Nothing changes for `rlsTransaction`: the statement that applies the tenant is the same.
+
+### Documentation
+
+- README: a section on `withTenantTransaction`; and, under `rlsTransaction`, "Errors and configuration", covering
+  the sealed `RlsException`, when each exception is thrown and what the client gets, the `TenantResolver` and
+  `CommitPredicate` types, `settingName` and `rlsTransactionOn`.
+
+### Tests
+
+- Repository-mode tests without a database, against PostgreSQL (tenant isolation, rollback, local settings that do
+  not outlive the transaction, exhausted pool) and in the stress suite.
+
 ## 0.1.2
 
 Consumed by `git` reference to the tag `v0.1.2`. Depends on `dart_backend_framework` 0.1.0 and
